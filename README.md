@@ -1,7 +1,5 @@
 # LSTM-Based-Sequence-Modeling-for-Healthcare-Professional-Engagement
 
-# HCP Journey Sequence Prediction using LSTM (Encoder–Decoder)
-
 This project builds an LSTM-based encoder–decoder model to predict the next best engagement touchpoint for Healthcare Professionals (HCPs).  
 In omnichannel pharma engagement, timing and sequencing of touchpoints (Email, Call, Visit, etc.) significantly influence engagement outcomes.  
 This model helps automate that decision-making by learning historical interaction behavior and generating the next likely touchpoint.
