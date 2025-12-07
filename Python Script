@@ -1,0 +1,457 @@
+import pandas as pd
+import numpy as np
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report, confusion_matrix, accuracy_score
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Dense
+from tensorflow.keras.utils import to_categorical
+
+
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
+import random
+
+# Set seed for reproducibility
+random.seed(42)
+np.random.seed(42)
+
+# Define sample data
+veeva_ids = [f"HCP_{i}" for i in range(1, 11)]
+touchpoint_types = ['Email', 'Call', 'Visit']
+
+# Generate dummy data
+data = []
+for veeva_id in veeva_ids:
+    num_touchpoints = random.randint(3, 5)
+    start_date = datetime(2023, 1, 1)
+    for _ in range(num_touchpoints):
+        touchpoint_time = start_date + timedelta(days=random.randint(1, 30))
+        touchpoint_type = random.choice(touchpoint_types)
+        data.append([veeva_id, touchpoint_type, touchpoint_time])
+        start_date = touchpoint_time
+
+# Initiate with DataFrame
+journey_df = pd.DataFrame(data, columns=['veeva_id', 'touchpoint_type', 'touchpoint_time']).sort_values(['veeva_id', 'touchpoint_time']).reset_index(drop=True)
+journey_df['touchpoint_time'] = pd.to_datetime(journey_df['touchpoint_time'])
+journey_df['time_diff'] = journey_df.groupby('veeva_id')['touchpoint_time'].diff().dt.total_seconds() / 86400
+journey_df['row_number'] = journey_df.groupby('veeva_id').cumcount() + 1
+
+from sklearn.preprocessing import LabelEncoder
+from sklearn.preprocessing import MinMaxScaler
+
+journey_df['label_encoded'] = LabelEncoder().fit_transform(journey_df['touchpoint_type'])
+journey_df['time_diff_seconds'] = journey_df['time_diff'].fillna(0).astype(int)
+journey_df['time_scaled'] = MinMaxScaler().fit_transform(journey_df[['time_diff_seconds']])
+
+
+#touchpoint_sequence = df.groupby('veeva_id')['label_encoded'].apply(list)
+
+#spark_df = spark.createDataFrame(journey_df); spark_df.createOrReplaceTempView("journey_df")
+journey_df
+
+
+touch_point_sequence = journey_df.groupby('veeva_id')['label_encoded'].apply(list)
+time_sequence = journey_df.groupby('veeva_id')['time_scaled'].apply(list)
+touch_point_sequence
+time_sequence
+
+from tensorflow.keras.preprocessing.sequence import pad_sequences
+padded_touchpoint = pad_sequences(touch_point_sequence, maxlen=10, padding='pre', truncating='post')
+padded_timediff = pad_sequences(time_sequence, maxlen=10, padding='pre', truncating='post')
+
+padded_touchpoint
+
+
+
+split_index = int(0.8 * len(padded_touchpoint))
+
+touchpoint_train = padded_touchpoint[:split_index]
+touchpoint_test = padded_touchpoint[split_index:]
+time_train = padded_timediff[:split_index]
+time_test = padded_timediff[split_index:]
+
+touchpoint_train
+
+from keras.models import Model
+from keras.layers import Input, LSTM, RepeatVector
+from keras.layers import TimeDistributed, Dense
+from keras.models import Model
+from keras.layers import Input, Embedding, LSTM, RepeatVector, TimeDistributed, Dense, Concatenate, Reshape
+from keras.callbacks import EarlyStopping
+from keras.optimizers import Adam
+import keras.backend as K
+import tensorflow as tf
+
+# Define a zero loss function
+def zero_loss(y_true, y_pred):
+    return tf.zeros_like(y_pred)
+
+timesteps = 10
+input_dim = 2
+
+#Encoder
+
+touchpoint_shape = Input(shape = (timesteps,), name = 'touchpoint_input')
+time_shape = Input(shape = (timesteps,), name = 'time_input')
+
+label_encoder = LabelEncoder()
+label_encoder.fit(journey_df['touchpoint_type'])
+
+embedding_dim = 10  # You can choose the embedding dimension
+touchpoint_embedding = Embedding(input_dim=len(label_encoder.classes_), output_dim=embedding_dim, input_length=timesteps)(touchpoint_shape)
+
+#Reshape time shape
+
+time_reshape = Reshape((timesteps,1))(time_shape)
+# time_reshape
+
+#Concatenate touchpoint and time
+
+concat_inputs = Concatenate(axis = -1)([touchpoint_embedding, time_reshape])
+# concat_inputs
+
+#LSTM Encoder
+
+encoder = LSTM(
+    16,
+    return_state=True,
+    name='LSTM'
+)
+encoder_outputs, state_h, state_c = encoder(concat_inputs)
+encoder_states = [state_h, state_c]
+print(encoder_states)
+
+#Decoder
+
+decoder_inputs = RepeatVector(timesteps)(state_h)
+decoder_lstm = LSTM(16, return_sequences = True, return_state = True)
+decoder_outputs, _, _ = decoder_lstm(decoder_inputs, initial_state = encoder_states)
+print(decoder_outputs)
+
+#touch point sequence
+
+touchpoint_dense = TimeDistributed(Dense(len(label_encoder.classes_), activation= 'softmax'), name = 'touchpoint_output')(decoder_outputs)
+print(touchpoint_dense)
+
+#time sequence
+
+time_dense = TimeDistributed(Dense(1), name = 'time_output')(decoder_outputs)
+print(time_dense)
+
+#Model with two outputs
+
+model = Model(inputs = [touchpoint_shape, time_shape], outputs = [touchpoint_dense, time_dense, state_h])
+
+
+# Compile the model with separate loss functions for each output
+model.compile(optimizer=Adam(learning_rate = 0.0005), 
+                    loss={'touchpoint_output': 'sparse_categorical_crossentropy', 
+                          'time_output': 'mse',
+                          'LSTM': zero_loss
+                           })
+model.summary()
+
+
+
+early_stopping = EarlyStopping(monitor='val_loss', patience=3, restore_best_weights=True)
+
+# Example data (assuming these are already defined)
+# touchpoint_train, time_train, touchpoint_test, time_test
+
+# Train the model
+# Training code
+history = model.fit(
+    [touchpoint_train, time_train],
+    [touchpoint_train, time_train, touchpoint_train],  # Separate labels for touchpoint, time, and dummy for state_h
+    epochs=100,
+    batch_size=32,
+    validation_data=([touchpoint_test, time_test], [touchpoint_test, time_test, touchpoint_test]),  # Separate validation labels
+    callbacks=[early_stopping]
+)
+
+# Evaluate the model
+evaluation = model.evaluate([touchpoint_test, time_test], [touchpoint_test, time_test, touchpoint_test])
+print(f"Test Loss: {evaluation}")
+
+
+import pandas as pd
+import numpy as np
+from tensorflow.keras.preprocessing.sequence import pad_sequences
+
+def predict_next_sequence(new_touchpoints, new_times, label_encoder, model, steps=5):
+    current_touchpoints = new_touchpoints.copy()
+    current_times = new_times.copy()
+    
+    predicted_labels = []
+    predicted_times = []
+    
+    for _ in range(steps):
+        padded_touchpoints = pad_sequences([current_touchpoints], maxlen=10, padding='pre')
+        padded_times = pad_sequences([current_times], maxlen=10, padding='pre')
+        
+        pred_touchpoints, pred_times, _ = model.predict([padded_touchpoints, padded_times], verbose=0)
+        
+        next_touchpoint_id = np.argmax(pred_touchpoints[0][-1])
+        next_time_value = pred_times[0][-1][0]
+        
+        next_touchpoint_label = label_encoder.inverse_transform([next_touchpoint_id])[0]
+        
+        predicted_labels.append(next_touchpoint_label)
+        predicted_times.append(next_time_value)
+        
+        current_touchpoints.append(next_touchpoint_id)
+        current_times.append(next_time_value)
+    
+    return predicted_labels, predicted_times
+
+# Main function
+def process_file_and_predict(df, label_encoder, scaler, model, steps=5):
+    # Load file
+    df = df.copy()  # or pd.read_excel(file_path)
+    
+    # Group sequences by HCP
+    grouped = df.groupby('veeva_id').agg({
+        'label_encoded': list,
+        'time_scaled': list
+    }).reset_index()
+    
+    results = []
+    
+    for _, row in grouped.iterrows():
+        hcp_id = row['veeva_id']
+        touchpoints = row['label_encoded']
+        times = row['time_scaled']
+        
+        predicted_labels, predicted_times_scaled = predict_next_sequence(touchpoints, times, label_encoder, model, steps)
+        
+        # Inverse scale times
+        predicted_times_original = scaler.inverse_transform(np.array(predicted_times_scaled).reshape(-1, 1)).flatten()
+        
+        
+        results.append({
+        'veeva_id': hcp_id,
+        'predicted_touchpoints': ' -> '.join(predicted_labels),
+        'predicted_times_days': predicted_times_original.tolist()
+         })
+
+    
+    # Convert to DataFrame
+    result_df = pd.DataFrame(results)
+    
+    
+    
+    pd.set_option('display.max_columns', None)
+    pd.set_option('display.width', None)
+    pd.set_option('display.max_colwidth', None)
+
+    print(result_df)
+ 
+    return result_df  # ✅ Return for further use
+
+
+from sklearn.preprocessing import MinMaxScaler
+
+# Fit scaler on original time differences
+scaler = MinMaxScaler()
+scaler.fit(journey_df[['time_diff_seconds']])
+
+
+# Example usage:
+process_file_and_predict(journey_df, label_encoder, scaler, model, steps=5)
+
+
+Updated Model
+
+
+
+import numpy as np
+import tensorflow as tf
+from tensorflow.keras.layers import Input, Embedding, LSTM, Concatenate, Reshape, TimeDistributed, Dense
+from tensorflow.keras.models import Model
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.preprocessing.sequence import pad_sequences
+
+# ---------------------------
+# 1) Prepare sequences safely
+# ---------------------------
+PAD_ID = 0
+TIMESTEPS = 10
+
+journey_df = journey_df.copy()
+journey_df['label_plus1'] = journey_df['label_encoded'] + 1  # reserve 0 for PAD
+
+g = journey_df.groupby('veeva_id').agg({
+    'label_plus1': list,
+    'time_scaled': list
+}).reset_index()
+
+X_tok  = pad_sequences(g['label_plus1'], maxlen=TIMESTEPS, padding='pre', truncating='post', value=PAD_ID)
+X_time = pad_sequences(g['time_scaled'],  maxlen=TIMESTEPS, padding='pre', truncating='post', value=0.0)
+
+# Targets: next-step (shift left by 1)
+y_tok  = X_tok.copy()
+y_time = X_time.copy()
+y_tok[:, :-1]  = X_tok[:, 1:]
+y_tok[:, -1]   = PAD_ID
+y_time[:, :-1] = X_time[:, 1:]
+y_time[:, -1]  = 0.0
+
+# ------- KEY FIX: match time target shape to model output (T, 1)
+y_time = y_time[..., None]  # (N, T, 1)
+
+# Masks (1 for non-PAD steps, else 0)
+w_tok  = (X_tok != PAD_ID).astype('float32')      # (N, T)
+w_time = w_tok[..., None]                          # (N, T, 1)  <-- KEY FIX
+
+# Train/test split
+split = int(0.8 * len(X_tok))
+X_tok_train, X_tok_test   = X_tok[:split],   X_tok[split:]
+X_time_train, X_time_test = X_time[:split],  X_time[split:]
+y_tok_train, y_tok_test   = y_tok[:split],   y_tok[split:]
+y_time_train, y_time_test = y_time[:split],  y_time[split:]
+w_tok_train, w_tok_test   = w_tok[:split],   w_tok[split:]
+w_time_train, w_time_test = w_time[:split],  w_time[split:]
+
+# Dtypes
+X_tok_train = X_tok_train.astype('int32')
+y_tok_train = y_tok_train.astype('int32')
+X_time_train = X_time_train.astype('float32')
+y_time_train = y_time_train.astype('float32')
+
+X_tok_test = X_tok_test.astype('int32')
+y_tok_test = y_tok_test.astype('int32')
+X_time_test = X_time_test.astype('float32')
+y_time_test = y_time_test.astype('float32')
+
+# Optional: quick sanity
+print('Shapes:')
+print('X_tok_train      ', X_tok_train.shape)
+print('X_time_train     ', X_time_train.shape)
+print('y_tok_train      ', y_tok_train.shape)   # (N, T)
+print('y_time_train     ', y_time_train.shape)  # (N, T, 1)  <-- matches model
+print('w_tok_train      ', w_tok_train.shape)   # (N, T)
+print('w_time_train     ', w_time_train.shape)  # (N, T, 1)
+
+# ---------------------------
+# 2) Build model
+# ---------------------------
+vocab_size = int(journey_df['label_plus1'].max()) + 1  # includes PAD
+
+embedding_dim = 16
+hidden = 64
+
+inp_tok  = Input(shape=(TIMESTEPS,), name='touch_in')
+inp_time = Input(shape=(TIMESTEPS,), name='time_in')
+
+emb = Embedding(vocab_size, embedding_dim, mask_zero=True, name='tok_emb')(inp_tok)
+time_feat = Reshape((TIMESTEPS, 1), name='time_reshape')(inp_time)
+x = Concatenate(axis=-1, name='concat')([emb, time_feat])
+
+x = LSTM(hidden, return_sequences=True, name='lstm')(x)
+
+out_tok  = TimeDistributed(Dense(vocab_size, activation='softmax'), name='touch_out')(x)
+out_time = TimeDistributed(Dense(1), name='time_out')(x)
+
+model = Model([inp_tok, inp_time], [out_tok, out_time])
+model.compile(
+    optimizer=Adam(5e-4),
+    loss={'touch_out': 'sparse_categorical_crossentropy',
+          'time_out' : tf.keras.losses.Huber(delta=1.0)},
+    loss_weights={'touch_out': 1.0, 'time_out': 0.2},
+    metrics={'touch_out': 'sparse_categorical_accuracy', 'time_out':'mae'}
+)
+model.summary()
+
+# ---------------------------
+# 3) Train (weights as list matching outputs)
+# ---------------------------
+es = tf.keras.callbacks.EarlyStopping(patience=4, restore_best_weights=True)
+
+history = model.fit(
+    [X_tok_train, X_time_train],
+    [y_tok_train, y_time_train],
+    sample_weight=[w_tok_train, w_time_train],      # <-- list, shapes (N,T) and (N,T,1)
+    validation_data=(
+        [X_tok_test, X_time_test],
+        [y_tok_test, y_time_test],
+        [w_tok_test, w_time_test]                   # apply mask in val too
+    ),
+    epochs=50,
+    batch_size=32,
+    callbacks=[es],
+    verbose=1
+)
+
+
+
+import numpy as np
+from tensorflow.keras.preprocessing.sequence import pad_sequences
+
+PAD_ID = 0
+TIMESTEPS = 10
+
+def decode_next_steps_shifted(model, label_encoder, start_touch_ids, start_times,
+                              steps=5, temperature=0.9, top_k=3):
+    """
+    Autoregressively predict `steps` next tokens and times.
+    Works with shifted id space: PAD=0, real classes 1..C.
+    Returns: (labels:list[str], times_scaled:list[float])
+    """
+    # Copy to avoid mutating caller's lists
+    tok_seq  = list(start_touch_ids)
+    time_seq = list(start_times)
+
+    pred_ids, pred_times = [], []
+
+    for _ in range(steps):
+        # Pad current sequences
+        ptok  = pad_sequences([tok_seq],  maxlen=TIMESTEPS, padding='pre', value=PAD_ID)
+        ptime = pad_sequences([time_seq], maxlen=TIMESTEPS, padding='pre', value=0.0)
+
+        # Forward pass
+        probs, tpred = model.predict([ptok, ptime], verbose=0)  # probs shape: (1, T, vocab)
+
+        # Last non-PAD index (guard if all PAD)
+        nonpad = np.where(ptok[0] != PAD_ID)[0]
+        last_idx = int(nonpad[-1]) if len(nonpad) else 0
+
+        # Logits for next token at last_idx
+        logits = np.log(probs[0, last_idx] + 1e-12)  # stabilise
+        logits[PAD_ID] = -1e9                        # never choose PAD
+
+        # Top-k filter (optional)
+        if top_k is not None:
+            keep = logits.argsort()[-top_k:]
+            masked = np.full_like(logits, -1e9)
+            masked[keep] = logits[keep]
+            logits = masked
+
+        # Temperature (optional)
+        if temperature != 1.0:
+            logits = logits / float(temperature)
+
+        # Softmax
+        p = np.exp(logits - logits.max())  # numerical stability
+        p = p / p.sum()
+
+        # Sample next id (use np.argmax(p) for greedy)
+        next_id = int(np.random.choice(len(p), p=p))
+
+        # Predict next time at same position
+        next_time_scaled = float(tpred[0, last_idx, 0])
+
+        # Append predictions
+        pred_ids.append(next_id)
+        pred_times.append(next_time_scaled)
+
+        # Feed back
+        tok_seq.append(next_id)
+        time_seq.append(next_time_scaled)
+
+    # Map predicted ids {1..C} -> original ids {0..C-1} -> string labels
+    orig_ids = [i - 1 for i in pred_ids if i > 0]  # skip PAD
+    labels = list(label_encoder.inverse_transform(orig_ids)) if len(orig_ids) > 0 else []
+
+    return labels, pred_times
